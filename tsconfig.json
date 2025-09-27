@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "module": "ESNext",
+    "lib": ["ES2020", "DOM"],
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "baseUrl": ".",
+    "paths": {
+      "@app/*": ["src/app/*"],
+      "@domain/*": ["src/domain/*"],
+      "@ports/*": ["src/ports/*"],
+      "@adapters/*": ["src/adapters/*"],
+      "@types/*": ["src/types/*"],
+      "@world/*": ["src/world/*"]
+    },
+    "outDir": "dist"
+  },
+  "include": ["src", "tests", "config"]
+}
+

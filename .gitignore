@@ -1,0 +1,16 @@
+# Node & build artifacts
+node_modules/
+dist/
+coverage/
+logs/
+.context/
+
+# Env & OS noise
+.env
+.env.*
+*.log
+*.DS_Store
+
+# Editor
+.vscode/
+.idea/
