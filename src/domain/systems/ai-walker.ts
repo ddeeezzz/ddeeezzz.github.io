@@ -3,7 +3,8 @@
  * - 让除玩家外的单位（teamA 全员 + teamB 除玩家）朝最近的敌方或锁定的障碍移动。
  * - 与自动开火系统保持目标一致：通过 ai/locked-target 事件同步“移动目标 = 攻击对象”。
  * - 使用 Map 存储障碍（key=obstacle:i），避免因数组 splice 导致 id 与索引错位，从而引发“原地不动不攻”。
- */
+ * - 障碍清空后配合自动开火持续追击敌人，直到逼近至安全距离再收步。
+*/
 import type { System, World } from '@domain/core/world' // 引入：系统/世界类型
 import { PLAYER_COLLISION_RADIUS } from '@domain/systems/movement' // 引入：与玩家相同的碰撞半径，用作 AI 单位半径
 import { EFFECTIVE_ATTACK_DIST } from './constants' // 引入：共享攻击有效距离，保证与开火一致
@@ -19,6 +20,7 @@ interface Walker { // 数据：被 AI 控制的单位
 
 const SPEED = 8 // 常量：AI 移动速度（m/s）固定为 8
 const AGENT_RADIUS = PLAYER_COLLISION_RADIUS // 常量：AI 单位半径
+const ENGAGE_HOLD_DIST = 0.5 // 常量：与敌人保持的最小交战距离（米）
 const DEBUG_AI = false // 调试：控制本系统的中文日志开关（默认关闭）
 
 export function aiWalkerSystem(): System { // 导出：AI 行走系统供装配使用
@@ -203,12 +205,13 @@ export function aiWalkerSystem(): System { // 导出：AI 行走系统供装配�
           const dx = en.x - w.x
           const dz = en.z - w.z
           const dist = Math.hypot(dx, dz)
-          // 攻击对象是角色：规则——若离开攻击范围，不再追逐；在射程内也无需前进
-          if (dist <= EFFECTIVE_ATTACK_DIST + 1e-6) {
-            target = null
+          // 攻击对象是角色：无论是否进入射程，只要未贴近到安全距离就持续追击
+          if (dist > ENGAGE_HOLD_DIST + 1e-6) {
+            target = { x: en.x, z: en.z }
+            if (DEBUG_AI) console.log('[AI] 锁定敌人，持续追击', { walker: w.id, target: currentLock.id, distance: dist })
           } else {
-            // 不追逐（按规则），保持位置不动
             target = null
+            if (DEBUG_AI) console.log('[AI] 已贴近锁定敌人，收束推进', { walker: w.id, target: currentLock.id, distance: dist })
           }
         }
       }
@@ -226,6 +229,7 @@ export function aiWalkerSystem(): System { // 导出：AI 行走系统供装配�
         }
         const enemyDist = nearestEnemy ? Math.sqrt(bestD2) : Infinity
         const enemyWithin = enemyDist <= EFFECTIVE_ATTACK_DIST + 1e-6
+        const shouldAdvanceEnemy = nearestEnemy ? enemyDist > ENGAGE_HOLD_DIST + 1e-6 : false
         if (!enemyWithin) {
           // 最近敌方在攻击距离外 → 若有障碍则去最近障碍，否则去最近敌方；若连敌人都没有且障碍清空 → 去敌方出生圈中心
           if (obstacles.size > 0) {
@@ -251,8 +255,10 @@ export function aiWalkerSystem(): System { // 导出：AI 行走系统供装配�
               target = null
             }
           }
+        } else if (shouldAdvanceEnemy && nearestEnemy) {
+          target = nearestEnemy
+          if (DEBUG_AI) console.log('[AI] 敌人已入射程，继续压进缩短距离', { walker: w.id, enemy: nearestEnemy, distance: enemyDist })
         } else {
-          // 最近敌方在攻击距离内 → 选择最近敌方，但移动上保持不前进（等待自动开火）
           target = null
         }
       }

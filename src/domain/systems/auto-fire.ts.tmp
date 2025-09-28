@@ -4,8 +4,7 @@
  *   1) 优先攻击“最近的障碍物”；
  *   2) 若“任一敌军进入有效攻击距离（4m）”或“障碍物已全部被击毁”，则优先攻击“最近的敌人”。
  * - 每秒触发一次开火，通过 combat/fire 事件下发，并强制使用计算出的方向（跳过自动瞄准队列）。
- * - 障碍清空后：持续锁定最近敌人，距离射程外也保持追击，待进入射程再发起攻击。
-*/
+ */
 import type { System, World } from '@domain/core/world' // 引入：系统/世界类型
 import { EFFECTIVE_ATTACK_DIST } from "./constants" // 引入：共享攻击有效距离常量
 
@@ -28,7 +27,6 @@ interface ShooterState { // 数据：射手状态
 
 const FIRE_INTERVAL = 1.0 // 常量：发射间隔（秒）
 const DEBUG_AF = false // 调试：自动开火锁定变更中文日志（默认关闭，可按需改为 true）
-const CHASE_LOG_LABEL = '[自瞄] 追击状态' // 常量：追击调试日志前缀
 
 /**
  * 创建自动开火系统
@@ -140,92 +138,74 @@ export function autoFireSystem(): System { // 导出：自动开火系统供装�
       })
       // 订阅单位移动：保持射手的 origin 与位置同步，并维护单位索引（含敌我，用于最近目标/队列计算）
       world.bus.on('unit/transform', (e) => {
-        const payload = e.payload as { id?: string; teamId?: 'teamA' | 'teamB'; position?: { x: number; z: number } } | undefined
-        if (!payload?.id || !payload.position) return
-
-        const resolvedTeamId: 'teamA' | 'teamB' | undefined =
-          (payload.teamId as 'teamA' | 'teamB' | undefined) ??
-          units.get(payload.id)?.teamId ??
-          shooters.get(payload.id)?.teamId
-
-        // 刷新单位坐标（若已有记录则更新，没有则在获取到阵营后补建）
-        const knownUnit = units.get(payload.id)
-        if (knownUnit) {
-          knownUnit.x = payload.position.x
-          knownUnit.z = payload.position.z
-          if (resolvedTeamId) knownUnit.teamId = resolvedTeamId
-        } else if (resolvedTeamId) {
-          units.set(payload.id, { id: payload.id, teamId: resolvedTeamId, x: payload.position.x, z: payload.position.z })
-        }
-
-        // 刷新射手自身位置，并重新评估其射程队列
-        const shooter = shooters.get(payload.id)
-        if (shooter) {
-          shooter.x = payload.position.x
-          shooter.z = payload.position.z
-          if (resolvedTeamId) shooter.teamId = resolvedTeamId
+        const p = e.payload as { id?: string; teamId?: 'teamA' | 'teamB'; position?: { x: number; z: number } } | undefined
+        if (!p?.id || !p.position) return
+        const s = shooters.get(p.id)
+        if (s) {
+          s.x = p.position.x
+          s.z = p.position.z
+          // 射手自身移动：需要重算该射手的 inRange 与队列（仅遍历敌对单位）
           units.forEach((u) => {
-            if (u.teamId === shooter.teamId) return
-            const dx = u.x - shooter.x
-            const dz = u.z - shooter.z
+            if (u.teamId === s.teamId) return
+            const dx = u.x - s.x
+            const dz = u.z - s.z
             const d = Math.hypot(dx, dz)
             const within = d <= EFFECTIVE_ATTACK_DIST + 1e-6
-            const was = shooter.enemyInRange.has(u.id)
+            const was = s.enemyInRange.has(u.id)
             if (within && !was) {
-              shooter.enemyInRange.add(u.id)
-              if (!shooter.enemyQueue.includes(u.id)) shooter.enemyQueue.push(u.id)
+              s.enemyInRange.add(u.id)
+              if (!s.enemyQueue.includes(u.id)) s.enemyQueue.push(u.id)
             } else if (!within && was) {
-              shooter.enemyInRange.delete(u.id)
-              shooter.enemyQueue = shooter.enemyQueue.filter((q) => q !== u.id)
-              if (shooter.locked?.kind === 'enemy' && shooter.locked.id === u.id) {
-                const next = shooter.enemyQueue[0]
+              s.enemyInRange.delete(u.id)
+              s.enemyQueue = s.enemyQueue.filter((q) => q !== u.id)
+              // 若当前锁定目标为该敌人且离开射程：
+              // - 队列非空：不追逐该目标，切换到队列下一个
+              // - 队列为空：清空锁，交由行走系统触发回退寻路（最近障碍/敌/出生圈）
+              if (s.locked?.kind === 'enemy' && s.locked.id === u.id) {
+                const next = s.enemyQueue[0]
                 if (next) {
-                  if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log('[自瞄] 锁定目标离射程（队列非空）：切换到队列头', { shooter: shooter.id, from: u.id, to: next })
-                  setLock(shooter, { kind: 'enemy', id: next })
-                } else if (obstacles.size === 0) {
-                  if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log(`${CHASE_LOG_LABEL} 锁定敌人离开射程，保持追击`, { shooter: shooter.id, target: u.id })
-                  // 障碍清空：保持原锁定，等待行走系统推进
+                  if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log('[自瞄] 锁定目标离射程（队列非空）：切换到队列头', { shooter: s.id, from: u.id, to: next })
+                  setLock(s, { kind: 'enemy', id: next })
                 } else {
-                  if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log('[自瞄] 锁定目标离射程（障碍未清空）：释放锁定以回退至障碍策略', { shooter: shooter.id, from: u.id })
-                  setLock(shooter, undefined)
+                  if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log('[自瞄] 锁定目标离射程（队列为空）：清空锁定，等待回退寻路', { shooter: s.id, from: u.id })
+                  setLock(s, undefined)
                 }
               }
             }
           })
         }
-
-        const enemyTeam = resolvedTeamId ?? knownUnit?.teamId
-        if (!enemyTeam) return
-
-        shooters.forEach((other, sid) => {
-          if (sid === payload.id) return
-          if (other.teamId === enemyTeam) return
-          const dx = payload.position.x - other.x
-          const dz = payload.position.z - other.z
-          const dist = Math.hypot(dx, dz)
-          const within = dist <= EFFECTIVE_ATTACK_DIST + 1e-6
-          const was = other.enemyInRange.has(payload.id)
-          if (within && !was) {
-            other.enemyInRange.add(payload.id)
-            if (!other.enemyQueue.includes(payload.id)) other.enemyQueue.push(payload.id)
-          } else if (!within && was) {
-            other.enemyInRange.delete(payload.id)
-            other.enemyQueue = other.enemyQueue.filter((q) => q !== payload.id)
-            if (other.locked?.kind === 'enemy' && other.locked.id === payload.id) {
-              const next = other.enemyQueue[0]
-              if (next) {
-                if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log('[自瞄] 锁定目标离射程（队列非空）：切换到队列头', { shooter: other.id, from: payload.id, to: next })
-                setLock(other, { kind: 'enemy', id: next })
-              } else if (obstacles.size === 0) {
-                if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log(`${CHASE_LOG_LABEL} 锁定敌人离开射程，保持追击`, { shooter: other.id, target: payload.id })
-                // 障碍清空：保持原锁定，等待行走系统推进
-              } else {
-                if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log('[自瞄] 锁定目标离射程（障碍未清空）：释放锁定以回退至障碍策略', { shooter: other.id, from: payload.id })
-                setLock(other, undefined)
+        // 更新单位索引（若能拿到 teamId 则写入，否则保持原值）
+        const u = units.get(p.id)
+        if (u) {
+          u.x = p.position.x
+          u.z = p.position.z
+          // 敌对单位移动：仅对与其为敌的射手更新 inRange/队列（O(#shooters)）
+          shooters.forEach((s2) => {
+            if (s2.teamId === (p.teamId ?? u.teamId)) return
+            const dx = (p.position as any).x - s2.x
+            const dz = (p.position as any).z - s2.z
+            const d = Math.hypot(dx, dz)
+            const within = d <= EFFECTIVE_ATTACK_DIST + 1e-6
+            const was = s2.enemyInRange.has(p.id)
+            if (within && !was) {
+              s2.enemyInRange.add(p.id)
+              if (!s2.enemyQueue.includes(p.id)) s2.enemyQueue.push(p.id)
+            } else if (!within && was) {
+              s2.enemyInRange.delete(p.id)
+              s2.enemyQueue = s2.enemyQueue.filter((q) => q !== p.id)
+              if (s2.locked?.kind === 'enemy' && s2.locked.id === p.id) {
+                const next = s2.enemyQueue[0]
+                if (next) {
+                  if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log('[自瞄] 锁定目标离射程（队列非空）：切换到队列头', { shooter: s2.id, from: p.id, to: next })
+                  setLock(s2, { kind: 'enemy', id: next })
+                } else {
+                  if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log('[自瞄] 锁定目标离射程（队列为空）：清空锁定，等待回退寻路', { shooter: s2.id, from: p.id })
+                  setLock(s2, undefined)
+                }
               }
             }
-          }
-        })
+          })
+        }
       })
 
       // 玩家专用：同步玩家坐标到单位索引，便于成为 teamA 的敌方目标
@@ -333,16 +313,13 @@ export function autoFireSystem(): System { // 导出：自动开火系统供装�
               const dz = u.z - s.z
               const d = Math.hypot(dx, dz)
               if (d > EFFECTIVE_ATTACK_DIST + 1e-6) {
-                // 离开攻击范围：若队列非空→切换到队列头；障碍清空时保持追击
+                // 离开攻击范围：若队列非空→切换到队列头；否则清空锁，交由行走系统回退
                 const next = s.enemyQueue[0]
                 if (next) {
                   if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log('[自瞄] 冷却触发检查：离射程（队列非空），切换队列头', { shooter: s.id, from: s.locked.id, to: next })
                   setLock(s, { kind: 'enemy', id: next })
-                } else if (obstacles.size === 0) {
-                  if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log(`${CHASE_LOG_LABEL} 冷却检测：锁定敌人距离超出射程，保持追击`, { shooter: s.id, target: s.locked.id, distance: d })
-                  // 保持锁定，等待行走系统推进
                 } else {
-                  if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log('[自瞄] 冷却触发检查：离射程（障碍未清空），清空锁以回退至障碍策略', { shooter: s.id, from: s.locked.id })
+                  if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log('[自瞄] 冷却触发检查：离射程（队列为空），清空锁', { shooter: s.id, from: s.locked.id })
                   setLock(s, undefined)
                 }
               } else {
@@ -417,9 +394,9 @@ export function autoFireSystem(): System { // 导出：自动开火系统供装�
               setLock(s, { kind: 'enemy', id: nearestEnemy.id })
             } else if (nearestObstacle) {
               setLock(s, { kind: 'obstacle', id: nearestObstacle.id })
-            } else if (nearestEnemy) {
-              setLock(s, { kind: 'enemy', id: nearestEnemy.id })
-              if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log(`${CHASE_LOG_LABEL} 障碍清空，开始追击最近敌人`, { shooter: s.id, enemy: nearestEnemy.id, distance: enemyDist })
+            } else if (nearestEnemy && obstacles.size === 0) {
+              // 敌人在射程外 & 障碍清空：不立即锁定，等待行走系统推进至射程内
+              if (typeof DEBUG_AF !== 'undefined' && DEBUG_AF) console.log('[自瞄] 障碍清空且敌在射程外，暂不锁定，等待行走系统推进', { shooter: s.id, enemy: nearestEnemy.id })
             }
           }
         }
