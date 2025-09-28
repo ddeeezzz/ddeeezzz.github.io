@@ -46,6 +46,8 @@ const PLAYER_TEAM: TeamId = 'teamB' // 玩家所属队伍（按约定固定为 t
 const EPS = 1e-4 // 极小值
 const PROJECTILE_RADIUS = 0.15 // 投射物半径
 const DAMAGE_PER_HIT = 50 // 每次命中伤害
+const FRIENDLY_BYPASS_OFFSET = 0.05 // 友军命中后的最小前移距离
+const MAX_FRIENDLY_BYPASS_PER_FRAME = 12 // 单帧内允许忽略友军的上限次数，防止死循环
 
 /**
  * 创建战斗系统
@@ -393,112 +395,151 @@ export function combatSystem(): System { // 导出：战斗系统供装配阶段
     if (dt <= 0 || projectiles.size === 0) return
 
     const destroyedProjectiles: string[] = []
-for (const proj of projectiles.values()) {
-  const step = PROJECTILE_SPEED * dt
-  if (step <= EPS) continue
-  const remaining = MAX_RANGE - proj.travelled
-  if (remaining <= EPS) {
-    destroyedProjectiles.push(proj.id)
-    continue
-  }
+    for (const proj of projectiles.values()) {
+      const step = PROJECTILE_SPEED * dt
+      if (step <= EPS) continue
+      const remainingRange = MAX_RANGE - proj.travelled
+      if (remainingRange <= EPS) {
+        destroyedProjectiles.push(proj.id)
+        continue
+      }
 
-  const physics = world.ports.physics
-  const moveDist = Math.min(step, remaining)
-  if (physics) {
-    const origin: [number, number, number] = [proj.x, 1, proj.z]
-    const dir: [number, number, number] = [proj.dirX, 0, proj.dirZ]
-    const hit = physics.sphereCast(origin, dir, PROJECTILE_RADIUS, moveDist)
-    const travel = Math.max(0, Math.min(hit.distance ?? moveDist, moveDist))
-    proj.x += proj.dirX * travel
-    proj.z += proj.dirZ * travel
-    proj.travelled += travel
+      const physics = world.ports.physics
+      const moveDist = Math.min(step, remainingRange)
+      let projectileDestroyed = false
+      if (physics) {
+        let remainingMove = moveDist
+        let friendlyBypassCount = 0
+        // 循环推进：直到耗尽当帧位移或撞上可被销毁的目标
+        while (remainingMove > EPS && !projectileDestroyed) {
+          const origin: [number, number, number] = [proj.x, 1, proj.z]
+          const dir: [number, number, number] = [proj.dirX, 0, proj.dirZ]
+          const hit = physics.sphereCast(origin, dir, PROJECTILE_RADIUS, remainingMove)
+          const travel = Math.max(0, Math.min(hit.distance ?? remainingMove, remainingMove))
 
-    if (hit.hit) {
-      const kind = hit.objectKind as string | undefined
-      const targetId = hit.objectId as string | undefined
-      let targetTeam: TeamId | null = null
-      if (kind === 'teamA') targetTeam = 'teamA'
-      else if (kind === 'teamB') targetTeam = 'teamB'
-
-      if (targetTeam && targetId) {
-        const isFriendly = proj.ownerTeamId === targetTeam
-        if (isFriendly) {
-          // 友军免伤：仅销毁投射物
-          // console.log('[战斗] 友军免伤：光球命中同队单位，已忽略伤害', {
-          //   projectile: proj.id,
-          //   ownerTeam: proj.ownerTeamId,
-          //   targetTeam,
-          //   targetId
-          // })
-          destroyedProjectiles.push(proj.id)
-        } else {
-          // 敌对单位：按队伍执行伤害
-          if (targetTeam === 'teamA') {
-            const enemy = enemies.get(targetId)
-            const nextHp = (hp ? hp.damage('teamA', targetId, DAMAGE_PER_HIT) : 50)
-            if (enemy && nextHp <= 0) {
-              world.bus.emit({ type: 'combat/kill', payload: { killerTeamId: proj.ownerTeamId, killerId: proj.ownerId, victimTeamId: 'teamA', victimId: targetId } })
-              handleEnemyRemoval(world, enemy)
-            }
-          } else if (targetTeam === 'teamB') {
-            const ally = allies.get(targetId)
-            const nextHp = (hp ? hp.damage('teamB', targetId, DAMAGE_PER_HIT) : 50)
-            if (ally && nextHp <= 0) {
-              world.bus.emit({ type: 'combat/kill', payload: { killerTeamId: proj.ownerTeamId, killerId: proj.ownerId, victimTeamId: 'teamB', victimId: targetId } })
-              handleEnemyRemoval(world, ally)
-            }
-            // 玩家死亡处理：玩家不在 allies 缓存，需要单独触发销毁/重生链路
-            if (targetId === 'player:1' && nextHp <= 0) {
-              const px = playerPos?.x ?? 0
-              const pz = playerPos?.z ?? 0
-              console.log('[战斗] 玩家 HP 归零，触发销毁与重生计划', { id: targetId, position: { x: px, z: pz } })
-              world.bus.emit({ type: 'combat/kill', payload: { killerTeamId: proj.ownerTeamId, killerId: proj.ownerId, victimTeamId: 'teamB', victimId: targetId } })
-              handleEnemyRemoval(world, { id: 'player:1', x: px, z: pz })
-            }
+          if (travel > EPS) {
+            proj.x += proj.dirX * travel
+            proj.z += proj.dirZ * travel
+            proj.travelled += travel
+            remainingMove -= travel
           }
+
+          if (!hit.hit) {
+            if (proj.travelled >= MAX_RANGE - EPS) {
+              console.log('[战斗] 投射物已达最大射程，散灭')
+              destroyedProjectiles.push(proj.id)
+              projectileDestroyed = true
+            } else {
+              updateProjectileVisual(world, proj)
+            }
+            break
+          }
+
+          const kind = hit.objectKind as string | undefined
+          const targetId = hit.objectId as string | undefined
+          let targetTeam: TeamId | null = null
+          if (kind === 'teamA') targetTeam = 'teamA'
+          else if (kind === 'teamB') targetTeam = 'teamB'
+
+          if (targetTeam && targetId) {
+            const isFriendly = proj.ownerTeamId === targetTeam
+            if (isFriendly) {
+              // 友军判定：忽略伤害并继续沿剩余距离前进，不消耗有效射程
+              friendlyBypassCount += 1
+              console.log('[战斗] 光球命中友军已忽略，继续尝试命中后方目标', {
+                projectile: proj.id,
+                ownerTeam: proj.ownerTeamId,
+                targetTeam,
+                targetId,
+                bypassCount: friendlyBypassCount
+              })
+              if (friendlyBypassCount > MAX_FRIENDLY_BYPASS_PER_FRAME) {
+                console.warn('[战斗] 单帧友军判定次数超限，投射物本帧停止推进以防死循环', {
+                  projectile: proj.id,
+                  ownerTeam: proj.ownerTeamId,
+                  remainingMove
+                })
+                remainingMove = 0
+                break
+              }
+              const bypass = Math.max(EPS, Math.min(FRIENDLY_BYPASS_OFFSET, remainingMove))
+              proj.x += proj.dirX * bypass
+              proj.z += proj.dirZ * bypass
+              remainingMove = Math.max(remainingMove - bypass, 0)
+              continue
+            }
+
+            if (targetTeam === 'teamA') {
+              const enemy = enemies.get(targetId)
+              const nextHp = hp ? hp.damage('teamA', targetId, DAMAGE_PER_HIT) : 50
+              if (enemy && nextHp <= 0) {
+                world.bus.emit({ type: 'combat/kill', payload: { killerTeamId: proj.ownerTeamId, killerId: proj.ownerId, victimTeamId: 'teamA', victimId: targetId } })
+                handleEnemyRemoval(world, enemy)
+              }
+            } else if (targetTeam === 'teamB') {
+              const ally = allies.get(targetId)
+              const nextHp = hp ? hp.damage('teamB', targetId, DAMAGE_PER_HIT) : 50
+              if (ally && nextHp <= 0) {
+                world.bus.emit({ type: 'combat/kill', payload: { killerTeamId: proj.ownerTeamId, killerId: proj.ownerId, victimTeamId: 'teamB', victimId: targetId } })
+                handleEnemyRemoval(world, ally)
+              }
+              if (targetId === 'player:1' && nextHp <= 0) {
+                const px = playerPos?.x ?? 0
+                const pz = playerPos?.z ?? 0
+                console.log('[战斗] 玩家 HP 归零，触发销毁与重生计划', { id: targetId, position: { x: px, z: pz } })
+                world.bus.emit({ type: 'combat/kill', payload: { killerTeamId: proj.ownerTeamId, killerId: proj.ownerId, victimTeamId: 'teamB', victimId: targetId } })
+                handleEnemyRemoval(world, { id: 'player:1', x: px, z: pz })
+              }
+            }
+
+            destroyedProjectiles.push(proj.id)
+            projectileDestroyed = true
+          } else {
+            if (kind === 'obstacle' && targetId) {
+              const nextHp = obHp ? obHp.damage(targetId, DAMAGE_PER_HIT) : 50
+              if (nextHp <= 0) {
+                world.bus.emit({ type: 'combat/obstacle-destroyed', payload: { obstacleId: targetId, killerTeamId: proj.ownerTeamId, killerId: proj.ownerId } })
+                console.log('[战斗] 障碍 HP 归零，触发销毁', { id: targetId })
+                world.destroyEntity(targetId)
+              }
+              destroyedProjectiles.push(proj.id)
+            } else {
+              destroyedProjectiles.push(proj.id)
+            }
+            projectileDestroyed = true
+          }
+        }
+
+        if (!projectileDestroyed && proj.travelled >= MAX_RANGE - EPS) {
+          console.log('[战斗] 投射物已达最大射程，散灭')
           destroyedProjectiles.push(proj.id)
+          projectileDestroyed = true
+        }
+
+        if (!projectileDestroyed && remainingMove <= EPS) {
+          updateProjectileVisual(world, proj)
         }
       } else {
-        // 命中地面/边界/障碍等：加入障碍受击处理
-        if (kind === 'obstacle' && targetId) {
-          const nextHp = (obHp ? obHp.damage(targetId, DAMAGE_PER_HIT) : 50)
-          if (nextHp <= 0) {
-            // 广播：障碍摧毁事件（用于+2分计分）。注意先广播再销毁实体，以便订阅方正确处理。
-            world.bus.emit({ type: 'combat/obstacle-destroyed', payload: { obstacleId: targetId, killerTeamId: proj.ownerTeamId, killerId: proj.ownerId } })
-            console.log('[战斗] 障碍 HP 归零，触发销毁', { id: targetId })
-            world.destroyEntity(targetId)
-          }
+        // 无物理端口：按直线位移近似
+        const travel = moveDist
+        proj.x += proj.dirX * travel
+        proj.z += proj.dirZ * travel
+        proj.travelled += travel
+        if (proj.travelled >= MAX_RANGE - EPS) {
+          console.log('[战斗] 投射物已达最大射程，散灭')
           destroyedProjectiles.push(proj.id)
+          projectileDestroyed = true
         } else {
-          destroyedProjectiles.push(proj.id)
+          updateProjectileVisual(world, proj)
         }
       }
-    } else if (proj.travelled >= MAX_RANGE - EPS) {
-      console.log('[战斗] 投射物已达最大射程，散灭')
-      destroyedProjectiles.push(proj.id)
-    } else {
-      updateProjectileVisual(world, proj)
     }
-  } else {
-    // 无物理端口：按直线位移近似
-    const travel = moveDist
-    proj.x += proj.dirX * travel
-    proj.z += proj.dirZ * travel
-    proj.travelled += travel
-    if (proj.travelled >= MAX_RANGE - EPS) {
-      console.log('[战斗] 投射物已达最大射程，散灭')
-      destroyedProjectiles.push(proj.id)
-    } else {
-      updateProjectileVisual(world, proj)
+
+    for (const id of destroyedProjectiles) {
+      projectiles.delete(id)
+      destroyVisual(world, id)
     }
   }
-}
 
-for (const id of destroyedProjectiles) {
-  projectiles.delete(id)
-  destroyVisual(world, id)
-}
-}
-
-return { name: 'Combat', update }
+  return { name: 'Combat', update }
 }

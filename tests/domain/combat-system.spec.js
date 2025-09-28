@@ -85,7 +85,7 @@ describe('CombatSystem', () => {
 
     world.step(0.1)
     input.releaseFire()
-    for (let i = 0; i < 3; i++) world.step(0.1)
+    for (let i = 0; i < 12; i++) world.step(0.1)
 
     expect(removedEnemies).toHaveLength(0)
     const projectileRemovals = render.removed.filter((id) => id.startsWith('projectile'))

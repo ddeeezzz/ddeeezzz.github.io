@@ -60,7 +60,7 @@ describe('Friendly fire immunity by projectile source team', () => {
     // 向前开火命中友军 teamB:0
     render.setPick({ objectId: 'teamB:0', objectKind: 'teamB', point: { x: 0, y: 0, z: 3 } })
     input.pressFire(); world.step(0.1); input.releaseFire()
-    for (let i = 0; i < 3; i++) world.step(0.1)
+    for (let i = 0; i < 12; i++) world.step(0.1)
 
     // 验证：未产生 setHp=50 的写入（免伤）
     const flat = statsUpdates.flat()
